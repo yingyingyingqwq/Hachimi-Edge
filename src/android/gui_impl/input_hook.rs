@@ -9,7 +9,7 @@ use jni::{
 
 use crate::{
     android::utils::{BACK_BUTTON_PRESSED, IS_IME_VISIBLE, get_activity, get_screen_dimensions},
-    core::{gui, Error, Gui, Hachimi},
+    core::{free_camera::{self, GamepadAxes, GamepadButton}, gui, Error, Gui, Hachimi},
     il2cpp::symbols::Thread
 };
 
@@ -30,7 +30,21 @@ const TOOL_TYPE_MOUSE: jint = 3;
 
 const AXIS_VSCROLL: jint = 9;
 const AXIS_HSCROLL: jint = 10;
+const AXIS_X: jint = 0;
+const AXIS_Y: jint = 1;
+const AXIS_Z: jint = 11;
+const AXIS_RZ: jint = 14;
+const AXIS_LTRIGGER: jint = 17;
+const AXIS_RTRIGGER: jint = 18;
 static SCROLL_AXIS_SCALE: f32 = 10.0;
+
+const KEYCODE_BUTTON_A: jint = 96;
+const KEYCODE_BUTTON_B: jint = 97;
+const KEYCODE_BUTTON_X: jint = 99;
+const KEYCODE_BUTTON_Y: jint = 100;
+const KEYCODE_BUTTON_L1: jint = 102;
+const KEYCODE_BUTTON_R1: jint = 103;
+const KEYCODE_BUTTON_START: jint = 108;
 
 static VOLUME_UP_PRESSED: AtomicBool = AtomicBool::new(false);
 static VOLUME_DOWN_PRESSED: AtomicBool = AtomicBool::new(false);
@@ -94,10 +108,6 @@ extern "C" fn nativeInjectEvent(mut env: JNIEnv, obj: JObject, input_event: JObj
     let action_masked = action & ACTION_MASK;
     let is_consuming = Gui::is_consuming_input_atomic();
 
-    if !is_consuming && (action_masked == ACTION_MOVE || action_masked == ACTION_HOVER_MOVE) {
-        return get_orig_fn!(nativeInjectEvent, NativeInjectEventFn)(env, obj, input_event, extra_param);
-    }
-
     let key_event_class = env.find_class("android/view/KeyEvent").unwrap();
     if env.is_instance_of(&input_event, &key_event_class).unwrap() {
         let key_code = env.call_method(&input_event, "getKeyCode", "()I", &[])
@@ -110,6 +120,7 @@ extern "C" fn nativeInjectEvent(mut env: JNIEnv, obj: JObject, input_event: JObj
             .unwrap();
 
         let pressed = action == ACTION_DOWN;
+        handle_free_camera_gamepad_key(key_code, pressed, repeat_count);
 
         match key_code {
             keymap::KEYCODE_VOLUME_UP => {
@@ -208,6 +219,12 @@ extern "C" fn nativeInjectEvent(mut env: JNIEnv, obj: JObject, input_event: JObj
 
     let motion_event_class = env.find_class("android/view/MotionEvent").unwrap();
     if env.is_instance_of(&input_event, &motion_event_class).unwrap() {
+        handle_free_camera_gamepad_motion(&mut env, &input_event);
+
+        if !is_consuming && (action_masked == ACTION_MOVE || action_masked == ACTION_HOVER_MOVE) {
+            return get_orig_fn!(nativeInjectEvent, NativeInjectEventFn)(env, obj, input_event, extra_param);
+        }
+
         let pointer_index = (action & ACTION_POINTER_INDEX_MASK) >> ACTION_POINTER_INDEX_SHIFT;
 
         let real_x = env.call_method(&input_event, "getX", "()F", &[])
@@ -362,6 +379,62 @@ extern "C" fn nativeInjectEvent(mut env: JNIEnv, obj: JObject, input_event: JObj
     }
 
     get_orig_fn!(nativeInjectEvent, NativeInjectEventFn)(env, obj, input_event, extra_param)
+}
+
+fn handle_free_camera_gamepad_key(key_code: jint, pressed: bool, repeat_count: jint) {
+    if Gui::is_gui_input_active_atomic() {
+        return;
+    }
+
+    let Some(button) = (match key_code {
+        KEYCODE_BUTTON_A => Some(GamepadButton::A),
+        KEYCODE_BUTTON_B => Some(GamepadButton::B),
+        KEYCODE_BUTTON_X => Some(GamepadButton::X),
+        KEYCODE_BUTTON_Y => Some(GamepadButton::Y),
+        KEYCODE_BUTTON_L1 => Some(GamepadButton::LeftBumper),
+        KEYCODE_BUTTON_R1 => Some(GamepadButton::RightBumper),
+        KEYCODE_BUTTON_START => Some(GamepadButton::Start),
+        keymap::KEYCODE_DPAD_UP => Some(GamepadButton::DpadUp),
+        keymap::KEYCODE_DPAD_DOWN => Some(GamepadButton::DpadDown),
+        keymap::KEYCODE_DPAD_LEFT => Some(GamepadButton::DpadLeft),
+        keymap::KEYCODE_DPAD_RIGHT => Some(GamepadButton::DpadRight),
+        _ => None,
+    }) else {
+        return;
+    };
+
+    if pressed && repeat_count != 0 {
+        match button {
+            GamepadButton::LeftBumper | GamepadButton::RightBumper => (),
+            _ => return,
+        }
+    }
+
+    free_camera::on_gamepad_button(button, pressed);
+}
+
+fn handle_free_camera_gamepad_motion(env: &mut JNIEnv, input_event: &JObject) {
+    if !free_camera::is_enabled() || Gui::is_gui_input_active_atomic() {
+        return;
+    }
+
+    let axes = GamepadAxes {
+        left_x: get_axis_value(env, input_event, AXIS_X),
+        left_y: -get_axis_value(env, input_event, AXIS_Y),
+        right_x: get_axis_value(env, input_event, AXIS_Z),
+        right_y: -get_axis_value(env, input_event, AXIS_RZ),
+        left_trigger: get_axis_value(env, input_event, AXIS_LTRIGGER).max(0.0),
+        right_trigger: get_axis_value(env, input_event, AXIS_RTRIGGER).max(0.0),
+    };
+
+    free_camera::on_gamepad_axes(axes);
+}
+
+fn get_axis_value(env: &mut JNIEnv, input_event: &JObject, axis: jint) -> f32 {
+    env.call_method(input_event, "getAxisValue", "(I)F", &[axis.into()])
+        .ok()
+        .and_then(|v| v.f().ok())
+        .unwrap_or(0.0)
 }
 
 fn get_ppp(mut env: JNIEnv, gui: &Gui) -> f32 {
