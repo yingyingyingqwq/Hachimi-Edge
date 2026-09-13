@@ -5,7 +5,7 @@ use once_cell::sync::OnceCell;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use textwrap::wrap_algorithms::Penalties;
 
-use crate::{core::{gui, plugin_api::Plugin, updater}, gui_impl, hachimi_impl, il2cpp::{self, hook::umamusume::{CySpringController::SpringUpdateMode, GameSystem}, sql::{CharacterData, SkillInfo}}};
+use crate::{core::{gui, plugin_api::Plugin, updater}, gui_impl, hachimi_impl, il2cpp::{self, hook::umamusume::{CySpringController::SpringUpdateMode, GameSystem}, sql::{CharacterData, SkillDataDesc, SkillInfo}}};
 
 use super::{game::{Game, Region}, ipc, plurals, template, template_filters, tl_repo, utils, Error, Interceptor};
 
@@ -15,6 +15,7 @@ pub const CODEBERG_API: &str = "https://codeberg.org/api/v1/repos";
 pub const WEBSITE_URL: &str = "https://hachimi.noccu.art";
 pub const UMAPATCHER_PACKAGE_NAME: &str = "com.leadrdrk.umapatcher.edge";
 pub const UMAPATCHER_INSTALL_URL: &str = "https://github.com/kairusds/UmaPatcher-Edge/releases/latest";
+pub const RACE_MECHANICS_URL: &str = "https://docs.google.com/document/d/15VzW9W2tXBBTibBRbZ8IVpW6HaMX8H0RP03kq6Az7Xg";
 
 static mut ORIG_SQLITE3_OPEN_V2: Option<extern "C" fn(*const i8, *mut *mut std::ffi::c_void, i32, *const i8) -> i32> = None;
 static mut ORIG_SQLITE3_KEY: Option<extern "C" fn(*mut std::ffi::c_void, *const std::ffi::c_void, i32) -> i32> = None;
@@ -66,6 +67,7 @@ pub struct Hachimi {
     pub chara_data: ArcSwap<CharacterData>,
     // Untranslated skill info
     pub skill_info: ArcSwap<SkillInfo>,
+    pub skill_data_desc: ArcSwap<SkillDataDesc>,
 
     // Shared properties
     pub game: Game,
@@ -88,6 +90,8 @@ pub struct Hachimi {
 }
 
 static INSTANCE: OnceCell<Arc<Hachimi>> = OnceCell::new();
+
+static SKILL_DATA_DESC_REBUILD_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 impl Hachimi {
     pub fn init() -> bool {
@@ -164,6 +168,7 @@ impl Hachimi {
             // Same with these
             chara_data: ArcSwap::default(),
             skill_info: ArcSwap::default(),
+            skill_data_desc: ArcSwap::default(),
 
             game,
             template_parser: template::Parser::new(&template_filters::LIST),
@@ -279,6 +284,23 @@ impl Hachimi {
         }
         
         self.localized_data.store(Arc::new(new_data));
+
+        if !self.skill_data_desc.load().descs.is_empty() {
+            SKILL_DATA_DESC_REBUILD_REQUESTED.store(true, atomic::Ordering::Release);
+        }
+    }
+
+    pub fn drain_skill_data_desc_rebuild(&self) {
+        if !SKILL_DATA_DESC_REBUILD_REQUESTED.swap(false, atomic::Ordering::AcqRel) {
+            return;
+        }
+        if self.skill_data_desc.load().descs.is_empty() {
+            return;
+        }
+        let data = SkillDataDesc::load_from_db();
+        if !data.descs.is_empty() {
+            self.skill_data_desc.store(Arc::new(data));
+        }
     }
 
     pub fn init_character_data(&self) {
@@ -294,6 +316,14 @@ impl Hachimi {
             let data = SkillInfo::load_from_db();
             self.skill_info.store(Arc::new(data));
             info!("Skill info loaded successfully.");
+        }
+    }
+
+    pub fn init_skill_data_desc(&self) {
+        if self.skill_data_desc.load().descs.is_empty() {
+            let data = SkillDataDesc::load_from_db();
+            self.skill_data_desc.store(Arc::new(data));
+            info!("Skill data descriptions loaded successfully.");
         }
     }
 
@@ -742,6 +772,8 @@ pub struct Config {
     #[serde(default)]
     pub skill_info_dialog: bool,
     #[serde(default)]
+    pub skill_data_desc: bool,
+    #[serde(default)]
     pub homescreen_bgseason: crate::il2cpp::hook::umamusume::GameDefine::BgSeason,
     pub sugoi_url: Option<String>,
     #[serde(default)]
@@ -752,8 +784,38 @@ pub struct Config {
     pub disable_skill_name_translation: bool,
     #[serde(default)]
     pub hide_ingame_ui_hotkey: bool,
+    #[serde(default)]
+    pub race_stat_hud: bool,
+    #[serde(default)]
+    pub race_stat_hud_toggle_button: bool,
+    #[serde(default)]
+    pub race_stat_had_autoscroll_0: bool,
+    #[serde(default)]
+    pub race_stat_had_autoscroll_1: bool,
+    #[serde(default)]
+    pub race_stat_hud_draggable: bool,
+    #[serde(default)]
+    pub race_stat_hud_draggable_save: bool,
+    #[serde(default = "Config::default_race_stat_hud_drag_x")]
+    pub race_stat_hud_drag_x: f32,
+    #[serde(default = "Config::default_race_stat_hud_drag_y")]
+    pub race_stat_hud_drag_y: f32,
+    #[serde(default = "Config::default_race_stat_hud_width_scale")]
+    pub race_stat_hud_width_scale: f32,
+    #[serde(default = "Config::default_race_stat_hud_height_scale")]
+    pub race_stat_hud_height_scale: f32,
+    #[serde(default)]
+    pub race_playback_slider: bool,
+    #[serde(default = "Config::default_true")]
+    pub race_playback_slider_always: bool,
+    #[serde(default)]
+    pub race_playback_button: bool,
+    #[serde(default)]
+    pub race_playback_key_enable: bool,
     #[serde(flatten)]
     pub caption: CaptionConfig,
+    #[serde(default)]
+    pub disable_tap_effect: bool,
     #[serde(default)]
     pub language: Language,
     #[serde(default = "Config::default_meta_index_url")]
@@ -827,6 +889,11 @@ impl Config {
     pub fn default_text_color() -> egui::Color32 { egui::Color32::from_gray(170) }
     pub fn default_window_rounding() -> f32 { 10.0 }
     fn default_tl_auto_updater_interval_sec() -> u64 { 3600 }
+    fn default_race_stat_hud_drag_x() -> f32 { -1.0 }
+    fn default_race_stat_hud_drag_y() -> f32 { -1.0 }
+    fn default_race_stat_hud_width_scale() -> f32 { 1.0 }
+    fn default_race_stat_hud_height_scale() -> f32 { 1.0 }
+    fn default_true() -> bool { true }
 }
 
 impl Default for Config {
@@ -882,7 +949,10 @@ pub enum Language {
     Filipino,
 
     #[serde(rename = "ru")]
-    Russian
+    Russian,
+
+    #[serde(rename = "ko")]
+    Korean
 }
 
 impl Default for Language {
@@ -904,6 +974,8 @@ impl Default for Language {
             Self::Filipino
         } else if locale.starts_with("ru") {
             Self::Russian
+        } else if locale.starts_with("ko") {
+            Self::Korean
         } else {
             Self::English
         }
@@ -920,7 +992,8 @@ impl Language {
         Self::Spanish.choice(),
         Self::BPortuguese.choice(),
         Self::Filipino.choice(),
-        Self::Russian.choice()
+        Self::Russian.choice(),
+        Self::Korean.choice()
     ];
 
     pub fn set_locale(&self) {
@@ -937,7 +1010,8 @@ impl Language {
             Language::Spanish => "es",
             Language::BPortuguese => "pt-br",
             Language::Filipino => "fil",
-            Language::Russian => "ru"
+            Language::Russian => "ru",
+            Language::Korean => "ko"
         }
     }
 
@@ -951,7 +1025,8 @@ impl Language {
             Language::Spanish => "Español (ES)",
             Language::BPortuguese => "Português (Brasil)",
             Language::Filipino => "Filipino",
-            Language::Russian => "Русский"
+            Language::Russian => "Русский",
+            Language::Korean => "한국어"
         }
     }
 
@@ -971,6 +1046,7 @@ pub struct LocalizedData {
     pub character_system_text_dict: FnvHashMap<i32, FnvHashMap<i32, String>>, // {"character_id": {"voice_id": "text"}}
     pub race_jikkyo_comment_dict: FnvHashMap<i32, String>, // {"id": "text"}
     pub race_jikkyo_message_dict: FnvHashMap<i32, String>, // {"id": "text"}
+    pub skill_data_desc_dict: FnvHashMap<String, String>, // {"skill_data_desc.<key>": "text"}
     assets_path: Option<PathBuf>,
 
     pub plural_form: plurals::Resolver,
@@ -1030,6 +1106,7 @@ impl LocalizedData {
             character_system_text_dict: Self::load_dict_static(&path, config.character_system_text_dict.as_ref()).unwrap_or_default(),
             race_jikkyo_comment_dict: Self::load_dict_static(&path, config.race_jikkyo_comment_dict.as_ref()).unwrap_or_default(),
             race_jikkyo_message_dict: Self::load_dict_static(&path, config.race_jikkyo_message_dict.as_ref()).unwrap_or_default(),
+            skill_data_desc_dict: Self::load_dict_static_ex(&path, Some("skill_data_desc_dict.json"), true).unwrap_or_default(),
             assets_path: path.as_ref()
                 .map(|p| config.assets_dir.as_ref()
                     .map(|dir| p.join(dir))
