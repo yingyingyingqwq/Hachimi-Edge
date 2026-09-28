@@ -5,9 +5,10 @@ use std::{
     ops::RangeInclusive,
     os::raw::c_void,
     panic::{self, AssertUnwindSafe},
+    path::Path,
     sync::{atomic::{self, AtomicBool, AtomicI32, AtomicU32, AtomicUsize}, Arc, Mutex},
     thread,
-    time::Instant
+    time::{Duration, Instant}
 };
 
 use egui::emath::GuiRounding as _;
@@ -352,6 +353,7 @@ const VALUE_CHIP_HUE_ORDER: f32 = 0.24;
 const VALUE_CHIP_HUE_START_DELAY: f32 = 0.90;
 const VALUE_CHIP_HUE_FINISH: f32 = 0.13;
 const VALUE_CHIP_HUE_LANE: f32 = 0.66;
+const VALUE_CHIP_HUE_PLAYER_NAME: f32 = 0.78;
 
 // glint sweep period seconds for the zenkai spurt effect on the speed and stamina visualizers
 const ZENKAI_GLINT_PERIOD: f32 = 1.2;
@@ -375,6 +377,7 @@ impl RaceStatHudTab {
 
 struct CharacterStats {
     name: String,
+    player_name: String,
     speed: f32,
     accel: Option<f32>,
     min_speed: f32,
@@ -413,6 +416,7 @@ impl Default for CharacterStats {
     fn default() -> CharacterStats {
         CharacterStats {
             name: String::new(),
+            player_name: String::new(),
             speed: 0.0,
             accel: None,
             min_speed: 0.0,
@@ -504,6 +508,8 @@ struct RaceStatHud {
     drag_save_pending: bool,
     entry_index: Option<usize>,
     toggle_key: Option<i32>,
+    resize_scale: Option<(f32, f32)>,
+    resize_dirty: bool,
     config: hachimi::Config,
     last_used_skills: Vec<i32>,
     last_unused_skills: Vec<i32>,
@@ -532,6 +538,8 @@ impl RaceStatHud {
             drag_save_pending: false,
             entry_index: None,
             toggle_key: None,
+            resize_scale: None,
+            resize_dirty: false,
             config: (**Hachimi::instance().config.load()).clone(),
             last_used_skills: Vec::new(),
             last_unused_skills: Vec::new(),
@@ -564,6 +572,8 @@ impl RaceStatHud {
             drag_save_pending: false,
             entry_index: None,
             toggle_key: None,
+            resize_scale: None,
+            resize_dirty: false,
             config: (**Hachimi::instance().config.load()).clone(),
             last_used_skills: Vec::new(),
             last_unused_skills: Vec::new(),
@@ -584,6 +594,8 @@ impl RaceStatHud {
             self.config = (**Hachimi::instance().config.load()).clone();
             self.drag_pos = Self::saved_drag_pos(&self.config);
             self.drag_travel = 0.0;
+            self.resize_scale = None;
+            self.resize_dirty = false;
         }
         if !visible && self.visible {
             self.save_autoscroll_config();
@@ -741,7 +753,7 @@ impl RaceStatHud {
         let is_vertical = game_view.width() <= game_view.height();
         let (width_scale, height_scale) = {
             let config = Hachimi::instance().config.load();
-            (config.race_stat_hud_width_scale, config.race_stat_hud_height_scale)
+            hud.resize_scale.unwrap_or((config.race_stat_hud_width_scale, config.race_stat_hud_height_scale))
         };
         let hud_scale = scale;
         let panel = Self::panel_size(game_view, is_vertical, hud_scale, width_scale, height_scale);
@@ -806,12 +818,12 @@ impl RaceStatHud {
         let can_add_clone = hud.clones.iter().filter(|c| c.visible).count() < 18;
 
         if !all_stats.is_empty() {
-            hud.run_hud(ctx, screen, game_view, panel, hud_scale, toggle_button, can_add_clone, &all_stats, course_info.as_ref());
+            hud.run_hud(ctx, screen, game_view, panel, hud_scale, width_scale, height_scale, toggle_button, can_add_clone, &all_stats, course_info.as_ref());
             for clone in hud.clones.iter_mut() {
                 if clone.selected_character >= all_stats.len() {
                     clone.selected_character = all_stats.len() - 1;
                 }
-                clone.run_hud(ctx, screen, game_view, panel, hud_scale, toggle_button, can_add_clone, &all_stats, course_info.as_ref());
+                clone.run_hud(ctx, screen, game_view, panel, hud_scale, width_scale, height_scale, toggle_button, can_add_clone, &all_stats, course_info.as_ref());
             }
         }
         hud.stats_buf = all_stats;
@@ -855,7 +867,6 @@ impl RaceStatHud {
                 hud.clones.push(clone);
             }
         }
-
         if toggle_button && !hud.visible {
             hud.run_button(ctx, game_view, hud_scale);
         }
@@ -976,7 +987,8 @@ impl RaceStatHud {
         Self::clamp_panel_min(game_view, panel, base + offset) - base
     }
 
-    // offset for a stored normalized position (0..1 within the game view)
+    // offset for a stored normalized top-left position; unlike interactive
+    // movement this is not size-clamped, so resizing keeps that corner fixed
     fn drag_offset_from_pos(game_view: egui::Rect, panel: egui::Vec2, vertical: bool, pos: Option<(f32, f32)>) -> egui::Vec2 {
         let Some((nx, ny)) = pos else {
             return egui::Vec2::ZERO;
@@ -986,7 +998,7 @@ impl RaceStatHud {
             game_view.left() + nx.clamp(0.0, 1.0) * game_view.width(),
             game_view.top() + ny.clamp(0.0, 1.0) * game_view.height(),
         );
-        Self::clamp_panel_min(game_view, panel, desired) - base
+        desired - base
     }
 
     // normalized position for a drag offset (what gets stored in the config)
@@ -1002,7 +1014,20 @@ impl RaceStatHud {
         )
     }
 
-    fn run_hud(&mut self, ctx: &egui::Context, screen: egui::Rect, game_view: egui::Rect, panel: egui::Vec2, scale: f32, toggle_button: bool, can_add_clone: bool, all_stats: &[CharacterStats], course_info: Option<&RaceCourseInfo>) {
+    fn run_hud(
+        &mut self,
+        ctx: &egui::Context,
+        screen: egui::Rect,
+        game_view: egui::Rect,
+        panel: egui::Vec2,
+        scale: f32,
+        width_scale: f32,
+        height_scale: f32,
+        toggle_button: bool,
+        can_add_clone: bool,
+        all_stats: &[CharacterStats],
+        course_info: Option<&RaceCourseInfo>,
+    ) {
         if !self.visible {
             return;
         }
@@ -1023,15 +1048,12 @@ impl RaceStatHud {
         let config = Hachimi::instance().config.load();
         let draggable = config.race_stat_hud_draggable;
         let drag_save = config.race_stat_hud_draggable_save;
+        let resizable = config.race_stat_hud_resizable;
         let opacity_scale = config.race_stat_hud_opacity_scale
             .clamp(RACE_STAT_HUD_OPACITY_SCALE_MIN, RACE_STAT_HUD_OPACITY_SCALE_MAX);
         drop(config);
 
-        let mut drag_offset = if draggable {
-            Self::drag_offset_from_pos(game_view, panel, is_vertical, self.drag_pos)
-        } else {
-            egui::Vec2::ZERO
-        };
+        let mut drag_offset = Self::drag_offset_from_pos(game_view, panel, is_vertical, self.drag_pos);
         let mut drag_active = false;
         let mut drag_travel = self.drag_travel;
 
@@ -1055,7 +1077,7 @@ impl RaceStatHud {
                     None
                 };
 
-                egui::Frame::NONE
+                let frame = egui::Frame::NONE
                     .fill(ui.visuals().window_fill.linear_multiply(opacity_scale))
                     .stroke(egui::Stroke::new(
                         ui.visuals().window_stroke.width,
@@ -1080,6 +1102,71 @@ impl RaceStatHud {
 
                         self.hud_contents(ui, all_stats, course_info, scale, inner.y, toggle_button, can_add_clone, draggable);
                     });
+
+                if resizable && !self.is_clone() {
+                    let handle_size = 16.0 * scale;
+                    let handle_rect = egui::Rect::from_min_size(
+                        frame.response.rect.right_bottom() - egui::Vec2::splat(handle_size),
+                        egui::Vec2::splat(handle_size),
+                    );
+                    let resize_response = ui.interact(handle_rect, area_id.with("resize"), egui::Sense::drag());
+                    let resize_stroke = ui.style().interact(&resize_response).fg_stroke;
+                    for inset in [3.0, 7.0, 11.0] {
+                        let inset = inset * scale;
+                        let points = [
+                            egui::pos2(handle_rect.right() - inset, handle_rect.bottom()),
+                            egui::pos2(handle_rect.right(), handle_rect.bottom() - inset),
+                        ];
+                        ui.painter().line_segment(points, resize_stroke);
+                    }
+
+                    if resize_response.hovered() || resize_response.dragged() {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                    }
+                    if resize_response.drag_started() {
+                        self.drag_pos = Some(Self::drag_pos_from_offset(
+                            game_view,
+                            panel,
+                            is_vertical,
+                            drag_offset,
+                        ));
+                        self.resize_dirty = false;
+                    }
+                    if resize_response.dragged() && panel.x > 0.0 && panel.y > 0.0 {
+                        let delta = resize_response.drag_delta();
+                        let desired_width = (panel.x + delta.x).max(1.0);
+                        let desired_height = (panel.y + delta.y).max(1.0);
+                        let new_scale = (
+                            Self::clamp_size_scale(
+                                width_scale * desired_width / panel.x,
+                                RACE_STAT_HUD_WIDTH_SCALE_MIN,
+                                RACE_STAT_HUD_WIDTH_SCALE_MAX,
+                            ),
+                            Self::clamp_size_scale(
+                                height_scale * desired_height / panel.y,
+                                RACE_STAT_HUD_HEIGHT_SCALE_MIN,
+                                RACE_STAT_HUD_HEIGHT_SCALE_MAX,
+                            ),
+                        );
+                        self.resize_scale = Some(new_scale);
+                        self.resize_dirty = true;
+                    }
+                    if resize_response.drag_stopped() && self.resize_dirty {
+                        if let Some((width_scale, height_scale)) = self.resize_scale {
+                            self.config.race_stat_hud_width_scale = width_scale;
+                            self.config.race_stat_hud_height_scale = height_scale;
+                            let mut new_config = (**Hachimi::instance().config.load()).clone();
+                            new_config.race_stat_hud_width_scale = width_scale;
+                            new_config.race_stat_hud_height_scale = height_scale;
+                            if let Some((x, y)) = self.drag_pos {
+                                new_config.race_stat_hud_drag_x = x;
+                                new_config.race_stat_hud_drag_y = y;
+                            }
+                            save_and_reload_config(new_config);
+                        }
+                        self.resize_dirty = false;
+                    }
+                }
 
                 // process the whole-panel drag handle registered above
                 if let Some(resp) = drag_response {
@@ -1406,6 +1493,12 @@ impl RaceStatHud {
     }
 
     fn stats_page(&mut self, ui: &mut egui::Ui, stats: &CharacterStats, course: Option<&RaceCourseInfo>, scale: f32) {
+        if !stats.player_name.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                Self::value_chip(ui, &stats.player_name, VALUE_CHIP_HUE_PLAYER_NAME, scale);
+            });
+        }
+
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(t!("race_stat_hud.speed")).size(13.0 * scale));
             self.chip_text.clear();
@@ -1542,14 +1635,9 @@ impl RaceStatHud {
             ui.label(egui::RichText::new(self.chip_text.as_str()).size(11.0 * scale).color(color));
         });
 
-        // phase
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(t!("race_stat_hud.phase")).size(13.0 * scale));
             Self::value_chip(ui, &Self::phase_name(stats.phase), VALUE_CHIP_HUE_PHASE, scale);
-        });
-
-        // order
-        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(t!("race_stat_hud.order")).size(13.0 * scale));
             if stats.cur_order >= 0 {
                 Self::ordinal_into(stats.cur_order + 1, &mut self.chip_text);
@@ -1680,17 +1768,17 @@ impl RaceStatHud {
             }
             if stats.temptation_mode != 0 {
                 self.chip_text.clear();
-                let _ = write!(self.chip_text, "{} ({}, x{})", t!("race_stat_hud.rushed"), Self::temptation_mode_name(stats.temptation_mode), stats.temptation_count);
+                let _ = write!(self.chip_text, "{} ({}, x{})", t!("race_stat_hud.rushed"), Self::temptation_mode_name(stats.temptation_mode), stats.temptation_count + 1);
                 Self::state_chip(ui, &self.chip_text, STATE_CHIP_HUE_BAD, scale);
             }
             if stats.is_compete_fight {
                 self.chip_text.clear();
-                let _ = write!(self.chip_text, "{} ({})", t!("race_stat_hud.compete_fight"), stats.compete_fight_count);
+                let _ = write!(self.chip_text, "{} ({})", t!("race_stat_hud.compete_fight"), stats.compete_fight_count + 1);
                 Self::state_chip(ui, &self.chip_text, STATE_CHIP_HUE_CONTEST, scale);
             }
             if stats.is_compete_top {
                 self.chip_text.clear();
-                let _ = write!(self.chip_text, "{} ({}, {:.1}s)", t!("race_stat_hud.compete_top"), stats.compete_top_count, stats.compete_top_remain_time);
+                let _ = write!(self.chip_text, "{} ({}, {:.1}s)", t!("race_stat_hud.compete_top"), stats.compete_top_count + 1, stats.compete_top_remain_time);
                 Self::state_chip(ui, &self.chip_text, STATE_CHIP_HUE_CONTEST, scale);
             }
             if se.run_at_full_speed {
@@ -1707,12 +1795,12 @@ impl RaceStatHud {
             }
             if se.compete_before_spurt {
                 self.chip_text.clear();
-                let _ = write!(self.chip_text, "{} ({})", t!("race_stat_hud.compete_before_spurt"), se.compete_before_spurt_count);
+                let _ = write!(self.chip_text, "{} ({})", t!("race_stat_hud.compete_before_spurt"), se.compete_before_spurt_count + 1);
                 Self::state_chip(ui, &self.chip_text, STATE_CHIP_HUE_CONTEST, scale);
             }
             if se.secure_lead {
                 self.chip_text.clear();
-                let _ = write!(self.chip_text, "{} ({})", t!("race_stat_hud.secure_lead"), se.secure_lead_count);
+                let _ = write!(self.chip_text, "{} ({})", t!("race_stat_hud.secure_lead"), se.secure_lead_count + 1);
                 Self::state_chip(ui, &self.chip_text, STATE_CHIP_HUE_CONTEST, scale);
             }
         });
@@ -2207,13 +2295,13 @@ impl RaceStatHud {
         }
 
         // name from HorseRaceInfo, fallback to HorseData
+        let horse_data = HorseRaceInfo::get_HorseData(race_info);
         let name_ptr = HorseRaceInfo::get_CharaName(race_info);
         if !name_ptr.is_null() {
             let s = unsafe { (*name_ptr).as_utf16str() };
             stats.name.clear();
             stats.name.extend(s.chars());
         } else {
-            let horse_data = HorseRaceInfo::get_HorseData(race_info);
             let hd_name = if !horse_data.is_null() { HorseData::get_charaName(horse_data) } else { 0 as _ };
             if !hd_name.is_null() {
                 let s = unsafe { (*hd_name).as_utf16str() };
@@ -2223,6 +2311,13 @@ impl RaceStatHud {
                 stats.name.clear();
                 stats.name.push('?');
             }
+        }
+
+        stats.player_name.clear();
+        let trainer_name_ptr = if !horse_data.is_null() { HorseData::get_TrainerName(horse_data) } else { 0 as _ };
+        if !trainer_name_ptr.is_null() {
+            let s = unsafe { (*trainer_name_ptr).as_utf16str() };
+            stats.player_name.extend(s.chars());
         }
 
         stats.speed = HorseRaceInfo::get__lastSpeed(race_info);
@@ -3345,7 +3440,7 @@ impl Gui {
                             if let Some(id) = focused {
                                 *owner_lock = Some(KeyboardOwner::JNI(id));
                             }
-                            self.ime_cooldown = Some(Instant::now() + std::time::Duration::from_millis(500));
+                            self.ime_cooldown = Some(Instant::now() + Duration::from_millis(500));
                         }
                     }
                 } else if focused.is_none() && self.last_focused.is_some() {
@@ -3886,7 +3981,7 @@ impl Gui {
 
         let mut changed = false;
         egui::ComboBox::new(ui.id().with(id_child), "")
-        .wrap_mode(egui::TextWrapMode::Extend)
+        .wrap_mode(egui::TextWrapMode::Wrap)
         .selected_text(selected)
         .show_ui(ui, |ui| {
             for choice in choices.iter() {
@@ -4389,6 +4484,63 @@ fn new_window<'a>(ctx: &egui::Context, id: egui::Id, title: impl Into<egui::Widg
     .constrain(false)
 }
 
+fn new_setup_window<'a>(ctx: &egui::Context, id: egui::Id, title: impl Into<egui::WidgetText>) -> egui::Window<'a> {
+    let scale = get_scale(ctx);
+    let salt = get_scale_salt(ctx);
+    let viewport_width = ctx.viewport_rect().width();
+
+    let max_width = (320.0 * scale).min((viewport_width - 24.0 * scale).max(96.0 * scale));
+    let title = fit_window_title(ctx, title.into(), (viewport_width - 24.0 * scale).max(96.0 * scale), scale);
+
+    egui::Window::new(title)
+    .id(id.with(salt.to_bits()))
+    .pivot(egui::Align2::CENTER_CENTER)
+    .fixed_pos(ctx.viewport_rect().max / 2.0)
+    .min_width(96.0 * scale)
+    .max_width(max_width)
+    .max_height(250.0 * scale)
+    .collapsible(false)
+    .resizable(false)
+    .constrain(false)
+}
+
+fn fit_window_title(ctx: &egui::Context, title: egui::WidgetText, budget_width: f32, scale: f32) -> egui::WidgetText {
+    let style = ctx.style();
+    let heading_size = style.text_styles.get(&egui::TextStyle::Heading).map_or(20.0, |font| font.size);
+    let inner_height = ctx.fonts_mut(|fonts| fonts.row_height(&egui::FontId::proportional(heading_size))).max(style.spacing.interact_size.y);
+    let button = style.spacing.icon_width.min(inner_height);
+    let left_pad = ((inner_height - button) / 2.0).round();
+    let budget = budget_width - 2.0 * (left_pad + button + style.spacing.item_spacing.x) - 4.0 * scale;
+    if budget <= 0.0 {
+        return title;
+    }
+    let text = title.text().to_owned();
+    let color = style.visuals.text_color();
+    let measure = |s: &str| {
+        let font_id = egui::FontId::proportional(heading_size);
+        ctx.fonts_mut(|fonts| fonts.layout_no_wrap(s.to_string(), font_id, color).size().x)
+    };
+    if measure(text.as_str()) <= budget {
+        return title;
+    }
+    let mut fitted = String::new();
+    for ch in text.chars() {
+        fitted.push(ch);
+        fitted.push('\u{2026}');
+        if measure(fitted.as_str()) > budget {
+            fitted.pop();
+            fitted.pop();
+            break;
+        }
+        fitted.pop();
+    }
+    if fitted.is_empty() {
+        return title;
+    }
+    fitted.push('\u{2026}');
+    fitted.into()
+}
+
 fn simple_window_layout(ui: &mut egui::Ui, id: egui::Id, add_contents: impl FnOnce(&mut egui::Ui), add_buttons: impl FnOnce(&mut egui::Ui)) {
     let builder = egui::UiBuilder::new()
         .id(id)
@@ -4743,6 +4895,53 @@ pub struct GameOpts {
 
 pub static GAME_OPTS_CACHE: Lazy<Mutex<Option<GameOpts>>> = Lazy::new(|| Mutex::new(None));
 
+struct HachifontScan {
+    signature: Vec<(String, u64, u64)>,
+    fonts: Arc<Vec<String>>
+}
+
+static HACHIFONT_CACHE: Lazy<Mutex<Option<HachifontScan>>> = Lazy::new(|| Mutex::new(None));
+const HACHIFONT_STAT_INTERVAL: Duration = Duration::from_secs(3);
+const HACHIFONT_EXTENSION: &str = "hachifont";
+
+fn stat_hachifonts(dir: &Path) -> Vec<(String, u64, u64)> {
+    let mut signature = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return signature;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.to_lowercase().ends_with(&format!(".{HACHIFONT_EXTENSION}")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        signature.push((name, meta.len(), mtime));
+    }
+    signature.sort();
+    signature
+}
+
+fn scan_hachifonts(dir: &Path) -> HachifontScan {
+    let signature = stat_hachifonts(dir);
+    let mut fonts = Vec::with_capacity(signature.len());
+    for (name, _, _) in &signature {
+        match crate::il2cpp::utils::read_font_pack(&dir.join(name)) {
+            Ok(_) => fonts.push(name.clone()),
+            Err(reason) => warn!("Ignoring font pack {name}: {reason}")
+        }
+    }
+    HachifontScan { signature, fonts: Arc::new(fonts) }
+}
+
 struct ConfigEditor {
     last_ptr_config: usize,
     config: hachimi::Config,
@@ -4761,6 +4960,10 @@ struct ConfigEditor {
     font_color_options: Arc<Vec<String>>,
     outline_size_options: Arc<Vec<String>>,
     outline_color_options: Arc<Vec<String>>,
+    hachifont_items: Arc<Vec<String>>,
+    hachifont_signature: Vec<(String, u64, u64)>,
+    hachifont_result: Option<Arc<Mutex<Option<HachifontScan>>>>,
+    hachifont_last_stat: Instant,
 }
 
 #[derive(Eq, PartialEq, Clone, Copy)]
@@ -4877,6 +5080,23 @@ impl ConfigEditor {
             outline_color_options = opts.outline_color_options;
         }
 
+        let (hachifont_items, hachifont_signature, hachifont_result) = {
+            let cache = HACHIFONT_CACHE.lock().unwrap();
+            if let Some(summary) = cache.as_ref() {
+                (summary.fonts.clone(), summary.signature.clone(), None)
+            } else {
+                drop(cache);
+                let result = Arc::new(Mutex::new(None));
+                let result_clone = result.clone();
+                let dir = Hachimi::instance().game.data_dir.clone();
+                thread::spawn(move || {
+                    let summary = scan_hachifonts(&dir);
+                    *result_clone.lock().unwrap() = Some(summary);
+                });
+                (Arc::new(Vec::new()), Vec::new(), Some(result))
+            }
+        };
+
         ConfigEditor {
             last_ptr_config: Arc::as_ptr(&handle) as usize,
             config: (**Hachimi::instance().config.load()).clone(),
@@ -4895,6 +5115,10 @@ impl ConfigEditor {
             font_color_options,
             outline_size_options,
             outline_color_options,
+            hachifont_items,
+            hachifont_signature,
+            hachifont_result,
+            hachifont_last_stat: Instant::now(),
         }
     }
 
@@ -4920,6 +5144,41 @@ impl ConfigEditor {
             ui.label("");
             ui.add(egui::Slider::new(num, range));
             ui.end_row();
+        }
+    }
+
+    fn spawn_hachifont_scan(&mut self) {
+        let result = Arc::new(Mutex::new(None));
+        self.hachifont_result = Some(result.clone());
+        let dir = Hachimi::instance().game.data_dir.clone();
+        thread::spawn(move || {
+            let summary = scan_hachifonts(&dir);
+            *result.lock().unwrap() = Some(summary);
+        });
+    }
+
+    fn poll_hachifonts(&mut self) {
+        if let Some(result) = self.hachifont_result.take() {
+            let drained = result.try_lock().ok().and_then(|mut lock| lock.take());
+            match drained {
+                Some(summary) => {
+                    self.hachifont_signature = summary.signature.clone();
+                    self.hachifont_items = summary.fonts.clone();
+                    *HACHIFONT_CACHE.lock().unwrap() = Some(summary);
+                }
+                None => {
+                    self.hachifont_result = Some(result);
+                }
+            }
+        }
+
+        if self.hachifont_result.is_none()
+            && self.hachifont_last_stat.elapsed() >= HACHIFONT_STAT_INTERVAL {
+            self.hachifont_last_stat = Instant::now();
+            let signature = stat_hachifonts(&Hachimi::instance().game.data_dir);
+            if signature != self.hachifont_signature {
+                self.spawn_hachifont_scan();
+            }
         }
     }
 
@@ -4993,6 +5252,41 @@ impl ConfigEditor {
                 if res.lost_focus() && config.meta_index_url.trim().is_empty() {
                     config.meta_index_url = hachimi::Config::default().meta_index_url;
                 }
+            }
+
+            if should_show_option(search, &t!("config_editor.custom_font_file")) {
+                ui.label(t!("config_editor.custom_font_file"));
+                if self.hachifont_items.is_empty() {
+                    ui.add_enabled_ui(false, |ui| {
+                        egui::ComboBox::new(ui.id().with("custom_font_file"), "")
+                            .selected_text(t!("config_editor.custom_font_none_found"))
+                            .wrap_mode(egui::TextWrapMode::Wrap)
+                            .show_ui(ui, |_| {});
+                    });
+                } else {
+                    let selected_text = {
+                        let selected = config.custom_font_file.get_or_insert_default();
+                        if selected.is_empty() {
+                            t!("default").into_owned()
+                        } else {
+                            selected.clone()
+                        }
+                    };
+                    egui::ComboBox::new(ui.id().with("custom_font_file"), "")
+                        .wrap_mode(egui::TextWrapMode::Wrap)
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            let selected = config.custom_font_file.get_or_insert_default();
+                            ui.selectable_value(selected, String::new(), t!("default"));
+                            for name in self.hachifont_items.iter() {
+                                ui.selectable_value(selected, name.clone(), name.clone());
+                            }
+                        });
+                    if config.custom_font_file.as_deref() == Some("") {
+                        config.custom_font_file = None;
+                    }
+                }
+                ui.end_row();
             }
 
             if should_show_option(search, &t!("config_editor.gui_scale")) {
@@ -5274,6 +5568,11 @@ impl ConfigEditor {
         if show_all || tab == ConfigEditorTab::Graphics {
             if should_show_option(search, &t!("config_editor.target_fps")) {
                 Self::option_slider(ui, &t!("config_editor.target_fps"), &mut config.target_fps, 30..=690);
+            }
+
+            #[cfg(target_os = "windows")]
+            if should_show_option(search, &t!("config_editor.target_fps_unfocused")) {
+                Self::option_slider(ui, &t!("config_editor.target_fps_unfocused"), &mut config.windows.target_fps_unfocused, 10..=30);
             }
 
             if should_show_option(search, &t!("config_editor.virtual_resolution_multiplier")) {
@@ -5721,6 +6020,13 @@ impl ConfigEditor {
                 && config.race_stat_hud && config.race_stat_hud_draggable {
                 ui.label(t!("config_editor.race_stat_hud_draggable_save"));
                 ui.checkbox(&mut config.race_stat_hud_draggable_save, "");
+                ui.end_row();
+            }
+
+            if should_show_option(search, &t!("config_editor.race_stat_hud_resizable")) && matches!(Hachimi::instance().game.region, Region::Japan | Region::Global)
+                && config.race_stat_hud {
+                ui.label(t!("config_editor.race_stat_hud_resizable"));
+                ui.checkbox(&mut config.race_stat_hud_resizable, "");
                 ui.end_row();
             }
 
@@ -6380,6 +6686,7 @@ impl Window for ConfigEditor {
         {
             config.windows.menu_open_key = global_handle.windows.menu_open_key;
         }
+        self.poll_hachifonts();
         let mut reset_clicked = false;
         let mut save_clicked = false;
 
@@ -6683,7 +6990,7 @@ impl Window for FirstTimeSetupWindow {
             { self.config.android.menu_open_key = raw; }
         }
 
-        new_window(ctx, self.id, t!("first_time_setup.title"))
+        new_setup_window(ctx, self.id, t!("first_time_setup.title"))
         .open(&mut open)
         .show(ctx, |ui| {
             let allow_next = match self.current_page {
@@ -6770,7 +7077,7 @@ impl Window for FirstTimeSetupWindow {
                         ui.label(t!("first_time_setup.common_settings_content"));
                         ui.add_space(4.0);
 
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(t!("config_editor.target_fps"));
                             let mut enabled = self.config.target_fps.is_some();
                             if ui.checkbox(&mut enabled, t!("enable")).changed() {
@@ -6787,15 +7094,27 @@ impl Window for FirstTimeSetupWindow {
                                 let _ = ui.add(egui::Slider::new(fps, 30..=690));
                             });
                         }
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(t!("config_editor.disable_skill_name_translation"));
                             let _ = ui.checkbox(&mut self.config.disable_skill_name_translation, "");
                         });
+<<<<<<< HEAD
                         ui.horizontal(|ui| {
                             ui.label(t!("config_editor.disable_factor_name_translation"));
                             let _ = ui.checkbox(&mut self.config.disable_factor_name_translation, "");
                         });
                         ui.horizontal(|ui| {
+=======
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(t!("config_editor.disable_factor_name_translation"));
+                            let _ = ui.checkbox(&mut self.config.disable_factor_name_translation, "");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(t!("config_editor.skill_data_desc"));
+                            let _ = ui.checkbox(&mut self.config.skill_data_desc, "");
+                        });
+                        ui.horizontal_wrapped(|ui| {
+>>>>>>> 49c0013b105f7d89b41a68dbb2715441f63ddf21
                             ui.label(t!("config_editor.menu_open_key"));
                             #[cfg(target_os = "windows")]
                             ui.label(crate::windows::utils::vk_to_display_label(self.config.windows.menu_open_key));
@@ -6825,7 +7144,7 @@ impl Window for FirstTimeSetupWindow {
                                 });
                             }
                         });
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(t!("config_editor.ui_animation_scale"));
                         });
                         let _ = ui.add(egui::Slider::new(&mut self.config.ui_animation_scale, 0.1..=10.0).step_by(0.1));
@@ -8284,7 +8603,7 @@ impl Window for AddTranslationRepoWindow {
         let mut open = true;
         let mut open2 = true;
 
-        new_window(ctx, self.id, t!("add_translation_repo.title"))
+        new_setup_window(ctx, self.id, t!("add_translation_repo.title"))
         .open(&mut open)
         .show(ctx, |ui| {
             ui.heading(t!("add_translation_repo.select_translation_repo"));
