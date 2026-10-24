@@ -114,6 +114,12 @@ pub fn replace_texture_with_diff_ex<P1: AsRef<Path>, P2: AsRef<Path>>(
 
     let Some((mut pixels, diff_info)) = load_rgba_png_file(&diff_path) else {
         error!("Failed to load texture diff: {}", diff_path.as_ref().display());
+        if fs::remove_file(&diff_path).is_ok() {
+            warn!("Removed corrupted texture diff, it will be re-downloaded on the next update: {}", diff_path.as_ref().display());
+        }
+        if allow_fallback {
+            return Texture2D::load_image_file(texture, &path, mark_non_readable);
+        }
         return false;
     };
 
@@ -274,13 +280,13 @@ fn read_font_pack_data(data: &[u8]) -> Result<(Vec<u8>, String), String> {
         .map_err(|e| format!("invalid zip file: {e}"))?;
 
     let font_path_entry = archive.file_names()
-        .find(|name| name.eq_ignore_ascii_case(FONT_PATH_ENTRY))
+        .find_map(|name| name.ok().filter(|name| name.eq_ignore_ascii_case(FONT_PATH_ENTRY)))
         .ok_or_else(|| format!("missing {FONT_PATH_ENTRY}"))?
-        .to_owned();
+        .into_owned();
     let bundle_entry = archive.file_names()
-        .find(|name| name.eq_ignore_ascii_case(INCLUDE_ENTRY))
+        .find_map(|name| name.ok().filter(|name| name.eq_ignore_ascii_case(INCLUDE_ENTRY)))
         .ok_or_else(|| format!("missing {INCLUDE_ENTRY}"))?
-        .to_owned();
+        .into_owned();
 
     let mut content = Vec::new();
     {
